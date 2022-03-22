@@ -18,8 +18,8 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"sort"
 
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	secretspb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 	grpccodes "google.golang.org/grpc/codes"
@@ -63,6 +63,11 @@ type SecretManagerCreateRequest struct {
 
 	// Plaintext is the plaintext to store.
 	Plaintext []byte
+
+	// Locations is an array indicating the canonical IDs (e.g. "us-east1") of
+	// the locations to the replicate data at. This defaults to the automatic
+	// replication policy when not specified. An empty array is not allowed.
+	Locations []string
 }
 
 func (r *SecretManagerCreateRequest) isCreateRequest() {}
@@ -85,7 +90,7 @@ func Create(ctx context.Context, i createRequest) (*Secret, error) {
 // existing secret.
 func (c *Client) Create(ctx context.Context, i createRequest) (*Secret, error) {
 	if i == nil {
-		return nil, errors.New("missing request")
+		return nil, fmt.Errorf("missing request")
 	}
 
 	switch t := i.(type) {
@@ -94,24 +99,48 @@ func (c *Client) Create(ctx context.Context, i createRequest) (*Secret, error) {
 	case *StorageCreateRequest:
 		return c.storageCreate(ctx, t)
 	default:
-		return nil, errors.Errorf("unknown create type %T", t)
+		return nil, fmt.Errorf("unknown create type %T", t)
 	}
 }
 
 func (c *Client) secretManagerCreate(ctx context.Context, i *SecretManagerCreateRequest) (*Secret, error) {
 	project := i.Project
 	if project == "" {
-		return nil, errors.New("missing project")
+		return nil, fmt.Errorf("missing project")
 	}
 
 	name := i.Name
 	if name == "" {
-		return nil, errors.New("missing secret name")
+		return nil, fmt.Errorf("missing secret name")
 	}
 
 	plaintext := i.Plaintext
 	if plaintext == nil {
-		return nil, errors.New("missing plaintext")
+		return nil, fmt.Errorf("missing plaintext")
+	}
+
+	var replication *secretspb.Replication
+	if len(i.Locations) == 0 {
+		replication = &secretspb.Replication{
+			Replication: &secretspb.Replication_Automatic_{
+				Automatic: &secretspb.Replication_Automatic{},
+			},
+		}
+	} else {
+		sort.Strings(i.Locations)
+		replicas := make([]*secretspb.Replication_UserManaged_Replica, len(i.Locations))
+
+		for n, loc := range i.Locations {
+			replicas[n] = &secretspb.Replication_UserManaged_Replica{Location: loc}
+		}
+
+		replication = &secretspb.Replication{
+			Replication: &secretspb.Replication_UserManaged_{
+				UserManaged: &secretspb.Replication_UserManaged{
+					Replicas: replicas,
+				},
+			},
+		}
 	}
 
 	logger := c.Logger().WithFields(logrus.Fields{
@@ -127,20 +156,15 @@ func (c *Client) secretManagerCreate(ctx context.Context, i *SecretManagerCreate
 	secretResp, err := c.secretManagerClient.CreateSecret(ctx, &secretspb.CreateSecretRequest{
 		Parent:   fmt.Sprintf("projects/%s", project),
 		SecretId: name,
-		Secret: &secretspb.Secret{
-			Replication: &secretspb.Replication{
-				Replication: &secretspb.Replication_Automatic_{
-					Automatic: &secretspb.Replication_Automatic{},
-				},
-			},
-		},
+		Secret:   &secretspb.Secret{Replication: replication},
 	})
+
 	if err != nil {
 		terr, ok := grpcstatus.FromError(err)
 		if ok && terr.Code() == grpccodes.AlreadyExists {
 			return nil, errSecretAlreadyExists
 		}
-		return nil, errors.Wrapf(err, "failed to create secret")
+		return nil, fmt.Errorf("failed to create secret: %w", err)
 	}
 
 	logger.Debug("creating secret version")
@@ -152,7 +176,7 @@ func (c *Client) secretManagerCreate(ctx context.Context, i *SecretManagerCreate
 		},
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create secret version")
+		return nil, fmt.Errorf("failed to create secret version: %w", err)
 	}
 
 	return &Secret{
@@ -161,28 +185,29 @@ func (c *Client) secretManagerCreate(ctx context.Context, i *SecretManagerCreate
 		Version:   path.Base(versionResp.Name),
 		Plaintext: plaintext,
 		UpdatedAt: timestampToTime(versionResp.CreateTime),
+		Locations: i.Locations,
 	}, nil
 }
 
 func (c *Client) storageCreate(ctx context.Context, i *StorageCreateRequest) (*Secret, error) {
 	bucket := i.Bucket
 	if bucket == "" {
-		return nil, errors.New("missing bucket name")
+		return nil, fmt.Errorf("missing bucket name")
 	}
 
 	object := i.Object
 	if object == "" {
-		return nil, errors.New("missing object name")
+		return nil, fmt.Errorf("missing object name")
 	}
 
 	key := i.Key
 	if key == "" {
-		return nil, errors.New("missing key name")
+		return nil, fmt.Errorf("missing key name")
 	}
 
 	plaintext := i.Plaintext
 	if plaintext == nil {
-		return nil, errors.New("missing plaintext")
+		return nil, fmt.Errorf("missing plaintext")
 	}
 
 	logger := c.Logger().WithFields(logrus.Fields{
@@ -196,7 +221,7 @@ func (c *Client) storageCreate(ctx context.Context, i *StorageCreateRequest) (*S
 
 	secret, err := c.encryptAndWrite(ctx, bucket, object, key, plaintext, 0, 0)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create secret")
+		return nil, fmt.Errorf("failed to create secret: %w", err)
 	}
 	return secret, nil
 }

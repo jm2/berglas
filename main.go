@@ -26,10 +26,10 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/GoogleCloudPlatform/berglas/pkg/berglas"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -70,6 +70,7 @@ var (
 	kmsLocation    string
 	kmsKeyRing     string
 	kmsCryptoKey   string
+	smLocations    []string
 )
 
 var rootCmd = &cobra.Command{
@@ -449,6 +450,8 @@ func main() {
 	rootCmd.AddCommand(createCmd)
 	createCmd.Flags().StringVar(&key, "key", "",
 		"KMS key to use for encryption")
+	createCmd.Flags().StringSliceVar(&smLocations, "locations", nil,
+		"Comma-separated canonical IDs in which to replicate secrets (e.g. 'us-east1,us-west-1')")
 
 	rootCmd.AddCommand(deleteCmd)
 
@@ -494,7 +497,9 @@ func main() {
 	updateCmd.Flags().StringVar(&key, "key", "",
 		"KMS key to use for re-encryption")
 
-	if err := rootCmd.Execute(); err != nil {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		fmt.Fprintf(stderr, "%s\n", err)
 		if terr, ok := err.(*exitError); ok {
 			os.Exit(terr.code)
@@ -503,12 +508,12 @@ func main() {
 	}
 }
 
-func accessRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func accessRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	// Deprecated - update to new syntax
 	if accessGeneration != 0 {
@@ -548,12 +553,12 @@ func accessRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func bootstrapRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func bootstrapRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	if err := client.Bootstrap(ctx, &berglas.BootstrapRequest{
 		ProjectID:      projectID,
@@ -592,34 +597,34 @@ func completionRun(cmd *cobra.Command, args []string) error {
 	switch shell := args[0]; shell {
 	case "bash":
 		if err := rootCmd.GenBashCompletion(stdout); err != nil {
-			err = errors.Wrap(err, "failed to generate bash completion")
+			err = fmt.Errorf("failed to generate bash completion: %w", err)
 			return apiError(err)
 		}
 	case "zsh":
 		if err := rootCmd.GenZshCompletion(stdout); err != nil {
-			err = errors.Wrap(err, "failed to generate zsh completion")
+			err = fmt.Errorf("failed to generate zsh completion: %w", err)
 			return apiError(err)
 		}
 
 		// enable the `source <(berglas completion SHELL)` pattern for zsh
 		if _, err := io.WriteString(stdout, "compdef _berglas berglas\n"); err != nil {
-			err = errors.Wrap(err, "failed to run compdef")
+			err = fmt.Errorf("failed to run compdef: %w", err)
 			return apiError(err)
 		}
 	default:
-		err := errors.Errorf("unknown completion %q", shell)
+		err := fmt.Errorf("unknown completion %q", shell)
 		return misuseError(err)
 	}
 
 	return nil
 }
 
-func createRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func createRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	ref, err := parseRef(args[0])
 	if err != nil {
@@ -637,6 +642,7 @@ func createRun(_ *cobra.Command, args []string) error {
 		secret, err := client.Create(ctx, &berglas.SecretManagerCreateRequest{
 			Project:   ref.Project(),
 			Name:      ref.Name(),
+			Locations: smLocations,
 			Plaintext: plaintext,
 		})
 		if err != nil {
@@ -645,6 +651,12 @@ func createRun(_ *cobra.Command, args []string) error {
 		fmt.Fprintf(stdout, "Successfully created secret [%s] with version [%s]\n",
 			secret.Name, secret.Version)
 	case berglas.ReferenceTypeStorage:
+		// Check if no unsupported options have been given
+		if len(smLocations) > 0 {
+			return misuseError(fmt.Errorf("locations on a per-secret basis unsupported for Storage keys"))
+		}
+
+		// Create the requested secret
 		secret, err := client.Create(ctx, &berglas.StorageCreateRequest{
 			Bucket:    ref.Bucket(),
 			Object:    ref.Object(),
@@ -654,6 +666,7 @@ func createRun(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return apiError(err)
 		}
+
 		fmt.Fprintf(stdout, "Successfully created secret [%s] with generation [%d]\n",
 			secret.Name, secret.Generation)
 	default:
@@ -663,12 +676,12 @@ func createRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func deleteRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func deleteRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	ref, err := parseRef(args[0])
 	if err != nil {
@@ -701,12 +714,12 @@ func deleteRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func editRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func editRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	// Find the editor
 	var editor string
@@ -717,7 +730,7 @@ func editRun(_ *cobra.Command, args []string) error {
 		}
 	}
 	if editor == "" {
-		err := errors.New("no editor is set - set VISUAL or EDITOR")
+		err := fmt.Errorf("no editor is set - set VISUAL or EDITOR")
 		return apiError(err)
 	}
 
@@ -753,7 +766,7 @@ func editRun(_ *cobra.Command, args []string) error {
 	// Create the tempfile
 	f, err := ioutil.TempFile("", "berglas-")
 	if err != nil {
-		err = errors.Wrap(err, "failed to create tempfile for secret")
+		err = fmt.Errorf("failed to create tempfile for secret: %w", err)
 		return apiError(err)
 	}
 
@@ -765,17 +778,17 @@ func editRun(_ *cobra.Command, args []string) error {
 
 	// Write contents to the original file
 	if _, err := f.Write(originalSecret.Plaintext); err != nil {
-		err = errors.Wrap(err, "failed to write tempfile for secret")
+		err = fmt.Errorf("failed to write tempfile for secret: %w", err)
 		return apiError(err)
 	}
 
 	if err := f.Sync(); err != nil {
-		err = errors.Wrap(err, "failed to sync tempfile for secret")
+		err = fmt.Errorf("failed to sync tempfile for secret: %w", err)
 		return apiError(err)
 	}
 
 	if err := f.Close(); err != nil {
-		err = errors.Wrap(err, "failed to close tempfile for secret")
+		err = fmt.Errorf("failed to close tempfile for secret: %w", err)
 		return apiError(err)
 	}
 
@@ -783,38 +796,38 @@ func editRun(_ *cobra.Command, args []string) error {
 	editorSplit := strings.Split(editor, " ")
 	editorCmd, editorArgs := editorSplit[0], editorSplit[1:]
 	editorArgs = append(editorArgs, f.Name())
-	cmd := exec.Command(editorCmd, editorArgs...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Start(); err != nil {
-		err = errors.Wrap(err, "failed to start editor")
+	externalCmd := exec.CommandContext(ctx, editorCmd, editorArgs...)
+	externalCmd.Stdin = stdin
+	externalCmd.Stdout = stdout
+	externalCmd.Stderr = stderr
+	if err := externalCmd.Start(); err != nil {
+		err = fmt.Errorf("failed to start editor: %w", err)
 		return misuseError(err)
 	}
-	if err := cmd.Wait(); err != nil {
+	if err := externalCmd.Wait(); err != nil {
 		if terr, ok := err.(*exec.ExitError); ok && terr.ProcessState != nil {
 			code := terr.ProcessState.ExitCode()
-			return exitWithCode(code, errors.Wrap(terr, "editor did not exit 0"))
+			return exitWithCode(code, fmt.Errorf("editor did not exit 0: %w", err))
 		}
-		err = errors.Wrap(err, "unknown failure in running editor")
+		err = fmt.Errorf("unknown failure in running editor: %w", err)
 		return misuseError(err)
 	}
 
 	// Read the new secret value
 	newPlaintext, err := ioutil.ReadFile(f.Name())
 	if err != nil {
-		err = errors.Wrapf(err, "failed to read secret tempfile")
+		err = fmt.Errorf("failed to read secret tempfile: %w", err)
 		return misuseError(err)
 	}
 
 	// Error if the secret is empty
 	if len(newPlaintext) == 0 {
-		err := errors.New("secret is empty")
+		err := fmt.Errorf("secret is empty")
 		return misuseError(err)
 	}
 
 	if bytes.Equal(newPlaintext, originalSecret.Plaintext) {
-		err := errors.New("secret unchanged - not going to update")
+		err := fmt.Errorf("secret unchanged - not going to update")
 		return misuseError(err)
 	}
 
@@ -827,7 +840,7 @@ func editRun(_ *cobra.Command, args []string) error {
 			Plaintext: newPlaintext,
 		})
 		if err != nil {
-			err = errors.Wrapf(err, "failed to update secret")
+			err = fmt.Errorf("failed to update secret: %w", err)
 			return misuseError(err)
 		}
 
@@ -843,7 +856,7 @@ func editRun(_ *cobra.Command, args []string) error {
 			Plaintext:      newPlaintext,
 		})
 		if err != nil {
-			err = errors.Wrapf(err, "failed to update secret")
+			err = fmt.Errorf("failed to update secret: %w", err)
 			return misuseError(err)
 		}
 
@@ -856,12 +869,12 @@ func editRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func execRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func execRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	execCmd := args[0]
 	execArgs := args[1:]
@@ -887,56 +900,26 @@ func execRun(_ *cobra.Command, args []string) error {
 		env[i] = fmt.Sprintf("%s=%s", k, s)
 	}
 
-	// Spawn the command
-	cmd := exec.Command(execCmd, execArgs...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	cmd.Env = env
-	if err := cmd.Start(); err != nil {
-		return misuseError(err)
+	execCmdFull, err := exec.LookPath(execCmd)
+	if err != nil {
+		return fmt.Errorf("failed to lookup path for %q: %w", execCmd, err)
 	}
 
-	// Listen for signals and send them to the underlying command
-	doneCh := make(chan struct{})
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh)
-	go func() {
-		for {
-			select {
-			case s := <-signalCh:
-				if cmd.Process == nil {
-					return
-				}
-				if signalErr := cmd.Process.Signal(s); signalErr != nil && err == nil {
-					fmt.Fprintf(stderr, "failed to signal command: %s\n", signalErr)
-				}
-			case <-doneCh:
-				signal.Stop(signalCh)
-				close(signalCh)
-				return
-			}
-		}
-	}()
+	// Unlike os/exec, execv(3) expects the arguments to include the command.
+	execArgs = append([]string{execCmdFull}, execArgs...)
 
-	// Wait for the command to finish
-	if err := cmd.Wait(); err != nil {
-		close(doneCh)
-		if terr, ok := err.(*exec.ExitError); ok && terr.ProcessState != nil {
-			code := terr.ProcessState.ExitCode()
-			return exitWithCode(code, errors.Wrap(terr, "process exited non-zero"))
-		}
-		return misuseError(err)
+	if err := syscall.Exec(execCmdFull, execArgs, env); err != nil {
+		return fmt.Errorf("failed to execute %q: %w", execCmd, err)
 	}
 	return nil
 }
 
-func grantRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func grantRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	ref, err := parseRef(args[0])
 	if err != nil {
@@ -973,12 +956,12 @@ func grantRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func listRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func listRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	var list *berglas.ListResponse
 
@@ -1032,12 +1015,12 @@ func listRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func migrateRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func migrateRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	bucket := strings.Trim(strings.TrimPrefix(args[0], "gs://"), "/")
 
@@ -1082,12 +1065,12 @@ func migrateRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func revokeRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func revokeRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	ref, err := parseRef(args[0])
 	if err != nil {
@@ -1124,12 +1107,12 @@ func revokeRun(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func updateRun(_ *cobra.Command, args []string) error {
-	client, ctx, closer, err := clientWithContext()
+func updateRun(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
+	client, err := clientWithContext(ctx)
 	if err != nil {
 		return misuseError(err)
 	}
-	defer closer()
 
 	ref, err := parseRef(args[0])
 	if err != nil {
@@ -1213,7 +1196,7 @@ func misuseError(err error) *exitError {
 func logger() (*logrus.Logger, error) {
 	level, err := logrus.ParseLevel(logLevel)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to parse log level")
+		return nil, fmt.Errorf("failed to parse log level: %w", err)
 	}
 
 	var formatter logrus.Formatter
@@ -1223,7 +1206,7 @@ func logger() (*logrus.Logger, error) {
 	case "json":
 		formatter = new(berglas.LogFormatterStackdriver)
 	default:
-		return nil, errors.Errorf("unknown log format %q", logFormat)
+		return nil, fmt.Errorf("unknown log format %q", logFormat)
 	}
 
 	return &logrus.Logger{
@@ -1236,32 +1219,19 @@ func logger() (*logrus.Logger, error) {
 
 // clientWithContext returns an instantiated berglas client and context with a
 // closer.
-func clientWithContext() (*berglas.Client, context.Context, func(), error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-
-	go func() {
-		select {
-		case <-c:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-
+func clientWithContext(ctx context.Context) (*berglas.Client, error) {
 	logger, err := logger()
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "failed to setup logger")
+		return nil, fmt.Errorf("failed to setup logger: %w", err)
 	}
 
 	client, err := berglas.New(ctx)
 	if err != nil {
-		return nil, nil, nil, errors.Wrap(err, "failed to create berglas client")
+		return nil, fmt.Errorf("failed to create berglas client: %w", err)
 	}
 	client.SetLogger(logger)
 
-	return client, ctx, cancel, nil
+	return client, nil
 }
 
 // readData reads the given string. If the string starts with an "@", it is
@@ -1305,7 +1275,7 @@ func parseRef(r string) (*berglas.Reference, error) {
 
 	ref, err := berglas.ParseReference(s)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse reference %q", s)
+		return nil, fmt.Errorf("failed to parse reference %q: %w", s, err)
 	}
 	return ref, nil
 }
